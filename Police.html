@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>模擬中央執法調度系統</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Courier New', Courier, monospace, "微軟正黑體"; }
+        body, html { width: 100%; height: 100%; background-color: #0a0e17; color: #00ffcc; overflow: hidden; }
+        
+        /* 頂部狀態列 */
+        #header {
+            height: 60px; background: rgba(10, 14, 23, 0.9);
+            border-bottom: 2px solid #00ffcc; display: flex;
+            align-items: center; justify-content: space-between; padding: 0 15px;
+            box-shadow: 0 0 10px rgba(0,255,255,0.5); z-index: 1000; position: relative;
+        }
+        .system-title { font-size: 18px; font-weight: bold; letter-spacing: 2px; text-shadow: 0 0 5px #00ffcc; }
+        
+        /* 地圖區域 */
+        #map { width: 100%; height: calc(100% - 180px); z-index: 1; }
+
+        /* 控制與任務面板 */
+        #control-panel {
+            height: 120px; background: #0f1626; border-top: 2px solid #00ffcc;
+            padding: 10px; display: flex; flex-direction: column; justify-content: space-between;
+            z-index: 1000; position: relative; box-shadow: 0 -5px 15px rgba(0,0,0,0.5);
+        }
+        .status-text { font-size: 14px; color: #ffcc00; text-overflow: ellipsis; white-space: nowrap; overflow: hidden; }
+        .btn {
+            background: #112233; color: #00ffcc; border: 1px solid #00ffcc;
+            padding: 10px; font-size: 16px; font-weight: bold; cursor: pointer;
+            text-transform: uppercase; transition: all 0.3s; text-align: center;
+            border-radius: 4px; box-shadow: inset 0 0 5px rgba(0,255,255,0.2);
+        }
+        .btn:active { background: #00ffcc; color: #000; }
+        .btn-danger { color: #ff5555; border-color: #ff5555; }
+        .btn-danger:active { background: #ff5555; color: #000; }
+
+        /* 執法記錄跳出視窗 */
+        #record-modal {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(5, 10, 20, 0.95); z-index: 2000; padding: 20px;
+            flex-direction: column; justify-content: center; align-items: center;
+        }
+        .record-box {
+            width: 100%; max-width: 400px; background: #131a2c; border: 2px solid #ffcc00;
+            padding: 20px; border-radius: 8px; box-shadow: 0 0 20px rgba(255,204,0,0.4);
+        }
+        .record-title { color: #ffcc00; font-size: 20px; margin-bottom: 15px; text-align: center; border-bottom: 1px solid #ffcc00; padding-bottom: 5px;}
+        .record-item { margin: 10px 0; font-size: 14px; color: #ffffff; }
+        .record-item span { color: #00ffcc; }
+    </style>
+</head>
+<body>
+
+    <div id="header">
+        <div class="system-title">警用調度系統 V4.2</div>
+        <div id="gps-status" style="font-size: 12px; color: #ff5555;">GPS 未連線</div>
+    </div>
+
+    <div id="map"></div>
+
+    <div id="control-panel">
+        <div id="mission-status" class="status-text">目前狀態：巡邏中，等待總部派案...</div>
+        <button id="action-btn" class="btn" onclick="triggerMission()">要求總部派案</button>
+    </div>
+
+    <div id="record-modal">
+        <div class="record-box">
+            <div class="record-title">執法行動報告書</div>
+            <div class="record-item">案件編號：<span id="r-id">#9527</span></div>
+            <div class="record-item">處置警員：<span id="r-officer">單位 01 (您)</span></div>
+            <div class="record-item">任務類型：<span id="r-type">未知</span></div>
+            <div class="record-item">事發地點：<span id="r-loc">未知座標</span></div>
+            <div class="record-item">結束時間：<span id="r-time">2026-06-25</span></div>
+            <div class="record-item">處置結果：<span style="color: #55ff55;">狀況已排除，現場恢復秩序。</span></div>
+            <button class="btn" style="margin-top:20px; width:100%; border-color:#ffcc00; color:#ffcc00;" onclick="closeRecord()">確認並上傳紀錄</button>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        let map;
+        let userMarker;
+        let targetMarker;
+        let currentStatus = "idle"; // idle, dispatched, arrived
+        let currentMission = {};
+
+        // 假任務清單
+        const missionTypes = [
+            "異常能量波動干擾，請前往調查。",
+            "民眾報案有可疑時空旅人聚集，請前往驅離。",
+            "發現未授權的無人機徘徊，請前往攔截。",
+            "突發性電子訊號異常，請前往現場重新引導民眾。"
+        ];
+
+        // 初始化地圖與 GPS 追蹤
+        function initMap() {
+            // 預設中心點 (台北)
+            map = L.map('map').setView([25.0330, 121.5654], 16);
+
+            // 使用 Dark Mode 風格的地圖圖磚
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+
+            // 啟動手機 GPS 監聽
+            if (navigator.geolocation) {
+                navigator.geolocation.watchPosition(updateLocation, handleLocationError, {
+                    enableHighAccuracy: true,
+                    maximumAge: 1000
+                });
+            } else {
+                alert("此裝置不支援 GPS 定位。");
+            }
+        }
+
+        // 更新使用者的即時位置
+        function updateLocation(position) {
+            const lat = position.coords.latitude;
+            const lng = position.coords.longitude;
+            
+            document.getElementById('gps-status').innerText = "GPS 已連線";
+            document.getElementById('gps-status').style.color = "#55ff55";
+
+            if (!userMarker) {
+                // 建立使用者藍色光圈標記
+                userMarker = L.circleMarker([lat, lng], {
+                    color: '#00ffcc', fillColor: '#00ffcc', fillOpacity: 0.4, radius: 10
+                }).addTo(map);
+                map.setView([lat, lng], 17);
+            } else {
+                userMarker.setLatLng([lat, lng]);
+            }
+
+            // 如果正在任務中，更新距離模擬導航
+            if (currentStatus === "dispatched" && targetMarker) {
+                const distance = map.distance([lat, lng], targetMarker.getLatLng());
+                document.getElementById('mission-status').innerText = `導航中... 距離目標還有 ${Math.round(distance)} 公尺`;
+                
+                // 距離小於 20 公尺時視為抵達
+                if (distance < 20) {
+                    arriveMission();
+                }
+            }
+        }
+
+        function handleLocationError(err) {
+            console.warn(`ERROR(${err.code}): ${err.message}`);
+            document.getElementById('gps-status').innerText = "GPS 訊號弱";
+        }
+
+        // 語音合成播報功能
+        function speak(text) {
+            if ('speechSynthesis' in window) {
+                // 先取消之前的語音避免堆疊
+                window.speechSynthesis.cancel();
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.lang = 'zh-TW';
+                utterance.rate = 1.0; // 語速
+                window.speechSynthesis.speak(utterance);
+            }
+        }
+
+        // 觸發任務 (點擊按鈕)
+        function triggerMission() {
+            if (currentStatus === "idle") {
+                if (!userMarker) {
+                    alert("等待 GPS 定位中，請稍後再試。");
+                    return;
+                }
+
+                // 取得目前使用者位置
+                const userLatLng = userMarker.getLatLng();
+
+                // 隨機在附近 (約 100-200公尺內) 生成一個假的地點
+                const offsetLat = (Math.random() - 0.5) * 0.003;
+                const offsetLng = (Math.random() - 0.5) * 0.003;
+                const targetLat = userLatLng.lat + offsetLat;
+                const targetLng = userLatLng.lng + offsetLng;
+
+                // 隨機抽選任務類型
+                const randomType = missionTypes[Math.floor(Math.random() * missionTypes.length)];
+                
+                currentMission = {
+                    id: "HQ-" + Math.floor(1000 + Math.random() * 9000),
+                    type: randomType,
+                    latLng: [targetLat, targetLng],
+                    time: new Date().toLocaleString()
+                };
+
+                // 在地圖上標註紅色警報點
+                targetMarker = L.marker([targetLat, targetLng]).addTo(map)
+                    .bindPopup(`<b>⚠️ 警報地點</b><br>${currentMission.type}`).openPopup();
+                
+                // 地圖視角縮放到可以容納兩者
+                const bounds = L.latLngBounds([userLatLng, [targetLat, targetLng]]);
+                map.fitBounds(bounds, { padding: [50, 50] });
+
+                // UI 更新
+                currentStatus = "dispatched";
+                document.getElementById('mission-status').innerText = `[已接單] 前往目標中...`;
+                
+                const btn = document.getElementById('action-btn');
+                btn.innerText = "手動確認抵達現場";
+                btn.className = "btn btn-danger";
+
+                // 語音提示
+                speak(`總部通知，案件編號 ${currentMission.id}。 ${currentMission.type}，請立刻前往該座標處理。`);
+
+            } else if (currentStatus === "dispatched") {
+                // 允許手動強制抵達 (防 GPS 飄移)
+                arriveMission();
+            }
+        }
+
+        // 抵達現場
+        function arriveMission() {
+            currentStatus = "arrived";
+            document.getElementById('mission-status').innerText = `已抵達現場，請執行處置...`;
+            
+            const btn = document.getElementById('action-btn');
+            btn.innerText = "完成處置並寫入紀錄";
+            btn.className = "btn";
+            btn.style.borderColor = "#ffcc00";
+            btn.style.color = "#ffcc00";
+
+            speak("您已抵達目的地。請注意自身安全，排除現場狀況後，點擊按鈕回報。");
+        }
+
+        // 完成任務，彈出執法紀錄
+        function finishMission() {
+            // 填入紀錄資料
+            document.getElementById('r-id').innerText = currentMission.id;
+            document.getElementById('r-type').innerText = currentMission.type;
+            document.getElementById('r-loc').innerText = `${currentMission.latLng[0].toFixed(4)}, ${currentMission.latLng[1].toFixed(4)}`;
+            document.getElementById('r-time').innerText = new Date().toLocaleString();
+
+            // 顯示 Modal
+            document.getElementById('record-modal').style.display = "flex";
+            speak("行動結束。執法紀錄報告書已自動生成，請確認上傳。");
+        }
+
+        // 點擊面板按鈕的綜合邏輯切換
+        document.getElementById('action-btn').addEventListener('click', function() {
+            if (currentStatus === "arrived") {
+                finishMission();
+            }
+        });
+
+        // 關閉並重設系統
+        function closeRecord() {
+            document.getElementById('record-modal').style.display = "none";
+            
+            // 移除地圖上的目標點
+            if (targetMarker) {
+                map.removeLayer(targetMarker);
+            }
+
+            // 重設狀態
+            currentStatus = "idle";
+            document.getElementById('mission-status').innerText = "目前狀態：巡邏中，等待總部派案...";
+            const btn = document.getElementById('action-btn');
+            btn.innerText = "要求總部派案";
+            btn.className = "btn";
+            btn.style = ""; // 恢復原樣
+            
+            speak("系統已重設，繼續執行巡邏勤務。");
+        }
+
+        // 網頁載入後啟動
+        window.onload = initMap;
+    </script>
+</body>
+</html>
